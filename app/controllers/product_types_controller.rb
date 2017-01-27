@@ -16,6 +16,24 @@ class ProductTypesController < ApplicationController
     redirect_to product_types_path
   end
 
+  def create
+    unless params[:product_type].empty?
+      params[:product_type].each do |data|
+        product_type = ProductType.find data[:id]
+        product_type.option_1 = data[:option_1]
+        product_type.option_2 = data[:option_2]
+        product_type.option_3 = data[:option_3]
+        product_type.option_1_extra = data[:option_1_extra]
+        product_type.option_2_extra = data[:option_2_extra]
+        product_type.option_3_extra = data[:option_3_extra]
+        product_type.aliexpress_link = data[:aliexpress_link]
+        product_type.aliexpress_link_extra = data[:aliexpress_link_extra]
+        product_type.save
+      end
+    end
+    redirect_to product_types_path, notice: "Salvo com sucesso"
+  end
+
   def show
     respond_with @product_type
   end
@@ -56,7 +74,7 @@ class ProductTypesController < ApplicationController
   end
 
   def product_type_params
-    params.require(:product_type).permit(:name, :aliexpress_link, :option_1,
-                                         :option_2, :option_3, :shipping)
+    params.require(:product_type).permit(:id, :name, :aliexpress_link, :aliexpress_link_extra, :option_1,
+                                         :option_2, :option_3, :shipping, :option_1_extra, :option_2_extra, :option_3_extra)
   end
 end

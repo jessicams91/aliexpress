@@ -9,19 +9,13 @@ class Crawler < ActiveRecord::Base
     raise "Não há pedidos a serem executados" if orders.nil? || orders.count == 0
 
     @log = CrawlerLog.create!(crawler: self, orders_count: orders.count)
+    # @log = CrawlerLog.create!(crawler: self, orders_count: 1)
     @b = Watir::Browser.new :phantomjs
-    Watir.default_timeout = 90
+    Watir.default_timeout = 120
     @b.window.maximize
     raise "Falha no login, verifique as informações de configuração aliexpress ou tente novamente mais tarde" unless self.login
-    # @b.div(class: "ng-switcher").when_present.click
-    # sleep 1
-    # @b.div(class: "country-selector").when_present.click
-    # sleep 1
-    # @b.span(class: "css_br").when_present.click
-    # sleep 1
-    # @b.button(class: "go-contiune-btn").when_present.click
-    # sleep 1
-    orders.reverse_each do |order|
+    # order = orders
+    orders.each do |order|
       @finished = false
       @error = nil
       begin
@@ -30,12 +24,15 @@ class Crawler < ActiveRecord::Base
         @log.add_message("Processando pedido ##{order['id']}")
         notes = self.wordpress.get_notes order
         unless notes.empty?
+          email_enviado = false
           notes.each do |note|
-            if note["note"].include? "Concluído"
-              self.wordpress.complete_order(order)
+            if note["note"].include? "Pedido(s) na Aliexpress"
               raise "Pedido ja executado!"
+            elsif note["note"].include? "Email Enviado!"
+              email_enviado = true
             end
           end
+          raise "Email não enviado!" unless email_enviado
         end
 
         self.empty_cart #Esvazia Carrinho
@@ -56,13 +53,12 @@ class Crawler < ActiveRecord::Base
                 product_type = ProductType.find_by(product: product, name: name.strip)
               end
               raise "Produto #{item["name"]} não encontrado, necessário importar do wordpress" if product_type.nil?
-              shipping = product_type.shipping
-              raise "Frete não implementado, pulando pedido!" unless shipping == 0 || shipping.nil?
-              order_items << {product_type: product_type, shipping: shipping}
+              # shipping = product_type.shipping
+              # order_items << {product_type: product_type, shipping: shipping}
+              order_items << {product_type: product_type}
               raise "Link aliexpress não cadastrado para #{item["name"]}" if product_type.aliexpress_link.nil?
               @b.goto product_type.parsed_link #Abre link do produto
-              frete = @b.div(class: "p-logistics-detail").present? ? @b.div(class: "p-logistics-detail").text : ""
-              # raise "Frete não é grátis para produto #{item["name"]}, cancelando pedido. Frete: #{frete}" unless frete.include?("gratuita") || frete.include?("free") || !product_type.shipping.nil?
+              # frete = @b.div(class: "p-logistics-detail").present? ? @b.div(class: "p-logistics-detail").text : ""
               user_options = [product_type.option_1, product_type.option_2 ,product_type.option_3]
               self.set_options user_options
               #Ações dos produtos
@@ -81,9 +77,18 @@ class Crawler < ActiveRecord::Base
           end
         #Finaliza pedido
         if @error.nil?
+          @b.goto 'https://shoppingcart.aliexpress.com/'
+          self.fill_shipping_address(customer)
+          # self.set_shipping(order_items)
           @b.goto 'https://m.aliexpress.com/shopcart/detail.htm'
           raise "Erro com itens do carrinho, cancelando pedido" if @b.lis(id: "shopcart-").count != order["line_items"].count
-          order_nos = self.complete_order(customer)
+          @b.div(class: "buyall").when_present.click #Botão Finalizar pedido
+          raise "Erro de cliente: #{@b.lis(class: "item")[3].text} diferente de #{customer["postcode"]}" unless @b.lis(class: "item")[3].text == customer["postcode"]
+          @b.button(id: "create-order").when_present.click #Botão Finalizar pedido
+          @log.add_message('Finalizando Pedido')
+          @finished = true
+          order_nos = @b.div(class:"desc_txt").when_present
+          # order_nos = self.complete_order(customer)
           raise if !@error.nil?
           @log.add_message("Pedido completado na Aliexpress")
           raise "Erro com numero do pedido vazio" if order_nos.nil?
@@ -133,9 +138,9 @@ class Crawler < ActiveRecord::Base
 
   #Adiciona item ao carrinho
   def add_to_cart
-    sleep 5
+    sleep 2
     @b.link(id: "j-add-cart-btn").when_present.click
-    sleep 5
+    sleep 2
     if @b.div(class: "ui-add-shopcart-dialog").present?
     else
       @error = "Falha ao adicionar ao carrinho: #{@b.url}"
@@ -150,22 +155,23 @@ class Crawler < ActiveRecord::Base
     end
   end
 
+
   #Seleciona o frete
   def set_shipping order_items
     order_items.each do |item|
       product_link = item[:product_type].link_id
       shipping = item[:shipping]
       unless shipping.nil? || shipping == 0
-        @b.goto 'https://shoppingcart.aliexpress.com/'
-        @b.tbodys.each do |product_info|
-          if product_info.a(class: "lnk-product-name").href.include?(product_link)
+        @b.trs(class: "item-product").each do |product_info|
+          if product_info.div(class: "p-title").a.href.include?(product_link)
             product_info.div(class: "product-shipping-select").when_present.click
             sleep 2
-            shipping_name = product_info.form.divs(class: "shipping-line")[shipping-1].text.split("\n")[0]
+            shipping_name = product_info.divs(class: "shipping-line")[shipping-1].text.split("\n")[0]
             @log.add_message("Produto com frete, selecionando frete: #{shipping_name}")
-            product_info.form.divs(class: "shipping-line")[shipping-1].when_present.click
+            product_info.radios[shipping-1].when_present.click
             sleep 2
-            product_info.form.button.when_present.click
+            product_info.button(class: "btn-ok").when_present.click
+            sleep 2
           end
         end
       end
@@ -182,76 +188,40 @@ class Crawler < ActiveRecord::Base
         option.as[selected-1].when_present.click
       end
     end
-    sleep 5
-  end
-
-  def add_to_cart_mobile
-    if @b.a(class: "back").present?
-      @b.a(class: "back").click
-      @b.button.when_present.click
-    else
-      @b.buttons[2].click
-    end
-    sleep 5
-  end
-
-  #Adiciona quantidade certa do item
-  def add_quantity_mobile quantity
-    (quantity -1).times do
-      @b.a(class:"ms-plus").when_present.click
-    end
-  end
-
-  #Selecionar opções do produto na Aliexpress usando array de opções da planilha
-  def set_options_mobile user_options
-    sleep 5
-    @b.divs(class: "ms-sku-props").each_with_index do |option, index|
-      selected = user_options[index]
-      if option.img.present? && selected.nil?
-        option.img.when_present.click
-      elsif option.img.present?
-        option.imgs[selected-1].when_present.click
-      elsif selected.nil?
-        option.span.when_present.click
-      else
-        option.spans[selected-1].when_present.click
-      end
-    end
-    sleep 5
-  end
-
-
-  #finaliza pedido com informações do cliente
-  def complete_order customer
-    @b.div(class: "buyall").when_present.click
-    @b.a(id: "change-address").when_present.click
     sleep 2
-    @b.a(id: "manageAddressHref").click if @b.a(id: "manageAddressHref").present?
-    #Preenche campos de endereço
+  end
+
+  #Iinformações do cliente
+  def fill_shipping_address customer
+    @b.button(class: "buy-now").when_present.click
+    sleep 3
+    @b.a(class: "sa-edit").present? ? @b.a(class: "sa-edit").click : @b.a(class: "sa-add-a-new-address").click
     @log.add_message('Adicionando informações do cliente')
-    @b.text_field(name: "_fmh.m._0.c").when_present.set to_english(customer["first_name"]+" "+customer["last_name"])
-    @b.divs(class: "panel-select")[0].when_present.click
-    sleep 5
-    @b.li(text: "Brazil").when_present.click
-    if customer['number'].nil?
-      @b.text_field(name: "_fmh.m._0.a").when_present.set to_english(customer["address_1"])
-    else
-      @b.text_field(name: "_fmh.m._0.a").when_present.set to_english(customer["address_1"]+" "+customer['number'])
+    while !@b.text_field(name: "contactPerson").text.contain?  to_english(customer["first_name"]+" "+customer["last_name"]) do
+      @b.text_field(name: "contactPerson").when_present.set to_english(customer["first_name"]+" "+customer["last_name"])
     end
-    @b.text_field(name: "_fmh.m._0.ad").when_present.set to_english(customer["address_2"])
-    @b.divs(class: "panel-select")[2].when_present.click
+    @b.select_list(name: "country").when_present.select "Brazil"
+    address = customer["address_1"]
+    address = address + ", "+ customer['number'] if customer['number']
+    address = address + " - "+ customer['address_2'] if customer['address_2']
+    while !@b.text_field(name: "address").text.contain? to_english(address) do
+      @b.text_field(name: "address").when_present.set to_english(address)
+    end
+    while !@b.text_field(name: "address2").text.contain? to_english(customer["neighborhood"])
+      @b.text_field(name: "address2").when_present.set to_english(customer["neighborhood"])
+    end
     arr = self.state.assoc(customer["state"])
-    sleep 5
-    @b.li(text: arr[1]).when_present.click
-    @b.text_field(name: "_fmh.m._0.ci").when_present.set to_english(customer["city"])
-    @b.text_field(name: "_fmh.m._0.z").when_present.set customer["postcode"]
-    @b.text_field(name: "_fmh.m._0.m").when_present.set '11941873849'
-    @b.button.click
-    @b.button(id: "create-order").when_present.click #Botão Finalizar pedido
-    @log.add_message('Finalizando Pedido')
-    @finished = true
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                @b.div(class:"desc_txt").wait_until_present
-    @b.div(class:"desc_txt")
+    @b.div(class: "sa-province-wrapper").select_list.when_present.select arr[1]
+    while !@b.text_field(name: "city").text.contain? to_english(customer["city"]) do
+      @b.text_field(name: "city").when_present.set to_english(customer["city"])
+    end
+    while !@b.text_field(name: "zip").text.contain? customer["postcode"] do
+      @b.text_field(name: "zip").when_present.set customer["postcode"]
+    end
+    # @b.text_field(name: "mobileNo").when_present.set ENV['TELEFONE']
+    @b.text_field(name: "cpf").when_present.set ENV['CPF']
+    @b.a(class: "sa-confirm").when_present.click
+    sleep 3
   end
 
   #Tabela de conversão de Estados
@@ -290,7 +260,7 @@ class Crawler < ActiveRecord::Base
   #Retira acentos e caracteres especiais
   def to_english string
     string.tr("ÀÁÂÃÄÅàáâãäåĀāĂăĄąÇçĆćĈĉĊċČčÐðĎďĐđÈÉÊËèéêëĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħÌÍÎÏìíîïĨĩĪīĬĭĮįİıĴĵĶķĸĹĺĻļĽľĿŀŁłÑñŃńŅņŇňŉŊŋÒÓÔÕÖØòóôõöøŌōŎŏŐőŔŕŖŗŘřŚśŜŝŞşŠšſŢţŤťŦŧÙÚÛÜùúûüŨũŪūŬŭŮůŰűŲųŴŵÝýÿŶŷŸŹźŻżŽž", "AAAAAAaaaaaaAaAaAaCcCcCcCcCcDdDdDdEEEEeeeeEeEeEeEeEeGgGgGgGgHhHhIIIIiiiiIiIiIiIiIiJjKkkLlLlLlLlLlNnNnNnNnnNnOOOOOOooooooOoOoOoRrRrRrSsSsSsSssTtTtTtUUUUuuuuUuUuUuUuUuUuWwYyyYyYZzZzZz")
-          .tr("^A-Za-z0-9 ", '')
+          .tr("^A-Za-z0-9-, ", '')
   end
 
   #Esvazia carrinho
